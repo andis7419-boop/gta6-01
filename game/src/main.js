@@ -1,333 +1,443 @@
+// main.js — boot, fixed-step loop, screen state machine, event bus.
+// Owns the world object and wires the modules together. No game rules here:
+// rules live in the modules called from tick(), in the frozen §2.3 order.
 import { GAME_CONFIG, KEY_BINDINGS } from './config.js';
 import { createRng } from './random.js';
 import { buildCity } from './city.js';
 import * as render from './render.js';
-import { createInput, updateInput, isDown, wasPressed, getLookDelta, consumeAction } from './input.js';
-import { updateVehicles } from './vehicles.js';
-import { updateTraffic } from './traffic.js';
-import { updatePedestrians } from './pedestrians.js';
-import { updateMission, startMission, retryMission, failMission, getNextMissionMarker } from './missions.js';
-import { updatePolice } from './police.js';
-import { updateCombat, punch, shoot } from './combat.js';
-import { createHud, updateHud, showMessage, showBriefing, flashDamage, hideBriefing } from './hud.js';
-import { initAudio, playSfx, setMuted, isMuted, updateAudio, audioEvent } from './audio.js';
-import { saveGame, loadGame, applySaveToWorld, hasSave, autosaveIfDue, clearSave } from './save.js';
-import { stageShot, updateAutopilot, countShotFrame, markShotReady, isShotMode, getShotInput } from './shots.js';
-function createEvents() { const queue = [];
-  let tick = 0;
-  return { emit(type, payload) { queue.push({ type, payload: payload || {}, tick });
-    }, drain() { const out = queue.slice();
-      queue.length = 0;
+import * as inputMod from './input.js';
+import * as vehicles from './vehicles.js';
+import * as traffic from './traffic.js';
+import * as pedestrians from './pedestrians.js';
+import * as police from './police.js';
+import * as combat from './combat.js';
+import * as missions from './missions.js';
+import * as hud from './hud.js';
+import * as audio from './audio.js';
+import * as save from './save.js';
+import * as shots from './shots.js';
+
+const STEP = GAME_CONFIG.step;
+
+function makeEventBus() {
+  const queue = [];
+  return {
+    emit(type, payload) {
+      queue.push({ type, payload: payload || {}, tick: 0 });
+    },
+    drain() {
+      const out = queue.splice(0, queue.length);
       return out;
-    }, setTick(n) { tick = n;
-    }, };
+    },
+  };
 }
-export function createWorld(seed) { const cityRng = createRng(seed);
-  const city = buildCity(cityRng);
-  const spawn = { x: -252, y: 0, z: -120 };
-  return { seed, tick: 0, clock: 0, timeOfDay: GAME_CONFIG.timeOfDayStart, screen: 'title', paused: true, muted: false,
-    city, player: { pos: { ...spawn }, heading: Math.PI / 2, speed: 0, onFoot: true, vehicleId: null, health: 100,
-      cash: 0, armour: 0, weapon: 'fists', ammo: 0, wantedHeat: 0, isRunning: false, isAiming: false, },
-    vehicles: [], pedestrians: [], police: { wanted: 0, heat: 0, officers: [], cars: [], escapeTimer: 0,
-      bustTimer: 0, }, mission: { activeId: null, doneIds: [], stage: 0, objectives: [], briefing: '',
-      timer: null, reward: 0, }, stats: { carsStolen: 0, missionsDone: 0, distanceDriven: 0, distanceWalked: 0,
-      pedsScared: 0, copsEvaded: 0, shotsFired: 0, bestCash: 0, }, flags: { metRosa: false, harbourOpen: false, ownsPistol: false }, };
+
+function buildWorld(seed) {
+  const cityRng = createRng(seed);
+  const world = {
+    seed,
+    tick: 0,
+    clock: 0,
+    timeOfDay: GAME_CONFIG.dayStartHour,
+    screen: 'title',
+    paused: false,
+    city: null,
+    player: {
+      pos: { x: -222, y: 0, z: 96 },
+      heading: 0,
+      speed: 0,
+      onFoot: true,
+      vehicleId: null,
+      health: 100,
+      cash: 0,
+      armour: 0,
+      weapon: 'fists',
+      ammo: 0,
+      wantedHeat: 0,
+      isRunning: false,
+      isAiming: false,
+    },
+    vehicles: [],
+    pedestrians: [],
+    police: {
+      wanted: 0,
+      heat: 0,
+      officers: [],
+      cars: [],
+      escapeTimer: 0,
+      bustTimer: 0,
+    },
+    mission: {
+      activeId: null,
+      stage: 0,
+      objectives: [],
+      briefing: '',
+      timer: null,
+      reward: 0,
+    },
+    stats: {
+      carsStolen: 0,
+      missionsDone: 0,
+      distanceDriven: 0,
+      distanceWalked: 0,
+      pedsScared: 0,
+      copsEvaded: 0,
+      shotsFired: 0,
+      bestCash: 0,
+    },
+    flags: { metRosa: false, harbourOpen: false, ownsPistol: false },
+    events: null,
+  };
+  world.city = buildCity(cityRng);
+  return world;
 }
-function activeInput() { const shot = getShotInput();
-  if (shot) return shot;
-  return currentGame ? currentGame.input : null;
+
+function spawnWorld(world) {
+  const parkedRng = createRng(world.seed + 404);
+  const trafficRng = createRng(world.seed + 101);
+  const pedRng = createRng(world.seed + 202);
+  vehicles.spawnParkedCars(world, parkedRng, 18);
+  traffic.spawnTraffic(world, trafficRng, GAME_CONFIG.trafficTarget);
+  pedestrians.spawnPedestrians(world, pedRng, GAME_CONFIG.pedTarget);
 }
-function missionSlot(world, dt) { const game = currentGame;
-  const emit = game ? game.events.emit : null;
-  const inp = activeInput();
-  if (world.screen === 'play' && !world.mission.activeId && inp && wasPressed(inp, 'enterCar')) { const marker = getNextMissionMarker(world);
-    if (marker && marker.kind === 'phone' && marker.missionId) { const dx = world.player.pos.x - marker.x;
-      const dz = world.player.pos.z - marker.z;
-      if (dx * dx + dz * dz < 36) { if (startMission(world, marker.missionId, emit)) {
-          if (marker.missionId === 'm4' && world.player.weapon !== 'pistol') { world.player.weapon = 'pistol';
-            world.player.ammo = (world.player.ammo || 0) + 48;
-            world.flags.ownsPistol = true;
-          }
-          consumeAction(inp, 'enterCar');
-        }
-      }
-    }
-  }
-  updateMission(world, dt, emit);
-}
-function combatSlot(world, dt) { const game = currentGame;
-  const emit = game ? game.events.emit : null;
-  const inp = activeInput();
-  const p = world.player;
-  if (world.screen === 'play' && p && p.onFoot && inp) { p.isAiming = isDown(inp, 'aim');
-    if (wasPressed(inp, 'punch')) punch(world, emit);
-    else if (isDown(inp, 'shoot')) { if (p.isAiming || p.weapon === 'pistol') shoot(world, null, emit);
-      else if (wasPressed(inp, 'shoot')) punch(world, emit);
-    }
-  } else if (p) p.isAiming = false;
-  updateCombat(world, dt, emit);
-}
-function inputSlot(world, dt) { const inp = activeInput();
-  if (!inp) return;
-  updateInput(inp);
-  const look = getLookDelta(inp);
-  currentCamera.yaw -= look.dx * GAME_CONFIG.mouseSensitivity;
-  currentCamera.pitch = Math.max(GAME_CONFIG.pitchMin, Math.min(GAME_CONFIG.pitchMax, currentCamera.pitch + look.dy * GAME_CONFIG.mouseSensitivity));
-  if (wasPressed(inp, 'pause') || wasPressed(inp, 'pauseAlt')) { if (world.screen === 'play') setScreen(world, 'pause');
-    else if (world.screen === 'pause') setScreen(world, 'play');
-  }
-  if (wasPressed(inp, 'mute')) toggleMute(world);
-  if (wasPressed(inp, 'help')) { const panel = typeof document !== 'undefined' ? document.getElementById('help-panel') : null;
-    toggleHelp(panel ? panel.classList.contains('hidden') : true);
-  }
-  if (wasPressed(inp, 'horn') && !world.player.onFoot) playSfx('horn');
-  if (wasPressed(inp, 'confirm') && currentGame) hideBriefing(currentGame.hud);
-}
-function routeEvent(world, e) { const game = currentGame;
-  if (!game) return;
-  const hud = game.hud;
-  audioEvent(e.type, e.payload, world);
-  if (!hud) return;
-  if (e.type === 'car-stolen') { showMessage(hud, world, 'Stolen: ' + (e.payload.make || '') + ' ' + (e.payload.model || ''), 3);
-  } else if (e.type === 'crime') { const texts = { theft: 'Car stolen!', 'hit-ped': 'You hit a pedestrian!',
-      shooting: 'Shots heard!', 'cop-kill': 'Cop down!', speeding: 'Speeding!', };
-    showMessage(hud, world, texts[e.payload.kind] || 'Crime committed', 3);
-  } else if (e.type === 'wanted-changed') { if (e.payload.wanted > 0) {
-      showMessage(hud, world, 'Wanted: ' + e.payload.wanted + ' star' + (e.payload.wanted > 1 ? 's' : ''), 3);
-    }
-  } else if (e.type === 'mission-started') { showBriefing(hud, world, e.payload.label || 'New job', world.mission.briefing || '');
-  } else if (e.type === 'objective-done') { showMessage(hud, world, 'Done: ' + (e.payload.label || ''), 3);
-  } else if (e.type === 'mission-done') { showMessage(hud, world, 'Job done — $' + (e.payload.reward || 0), 4);
-  } else if (e.type === 'mission-failed') { showMessage(hud, world, 'Job failed: ' + (e.payload.label || ''), 4);
-  } else if (e.type === 'escaped') { showMessage(hud, world, 'You lost them.', 3);
-  } else if (e.type === 'damage') { flashDamage(hud, world);
-  } else if (e.type === 'shot-fired') { render.flashEffect('muzzle');
-  }
-}
-let currentCamera = { mode: 'title', yaw: 0, pitch: 0.1 };
-export function createGame(canvas, opts = {}) { const seed = opts.seed || 1;
-  const world = createWorld(seed);
-  const events = createEvents();
-  const input = createInput(canvas, KEY_BINDINGS, { onLockLost() { if (world.screen === 'play') setScreen(world, 'pause');
-    }, });
-  const hud = createHud(typeof document !== 'undefined' ? document : null);
-  initAudio();
-  const renderer = render.createRenderer(canvas);
+
+export function createGame(canvas, opts) {
+  const options = opts || {};
+  const params = options.params || new URLSearchParams(typeof window !== 'undefined' ? window.location.search : '');
+  const seedRaw = parseInt(params.get('seed') || '1', 10);
+  const seed = Number.isFinite(seedRaw) ? seedRaw : 1;
+  const world = buildWorld(seed);
+  const events = makeEventBus();
+  world.events = events;
+
+  const cameraState = { yaw: 0, pitch: 0.35, mode: 'title' };
+  const input = inputMod.createInput(canvas, KEY_BINDINGS);
+  world.input = input; // lets shots.js drive the autopilot through real input
+  let hudHandle = null;
+  let running = false;
   let rafId = 0;
   let lastFrameMs = 0;
   let accumulator = 0;
   let firstFrameDone = false;
   let watchdogFired = false;
-  const bootMs = typeof performance !== 'undefined' ? performance.now() : 0;
-  function step() { tick(world, GAME_CONFIG.step);
-    world.tick++;
-    world.clock += GAME_CONFIG.step;
+
+  function setScreen(screen) {
+    world.screen = screen;
+    world.paused = screen !== 'play';
+    input.playing = screen === 'play'; // gates pointer lock + key preventDefault
+    // Leaving play must release the pointer: while locked, the browser
+    // retargets every mouse event to the canvas, so pause-menu buttons
+    // would never receive a click (headless keeps the lock after Esc).
+    if (screen !== 'play' && typeof document !== 'undefined' && document.pointerLockElement) {
+      document.exitPointerLock();
+    }
+    events.emit('screen-changed', { screen });
+    render.setCameraMode(screen === 'title' ? 'title' : world.player.onFoot ? 'foot' : 'chase');
+    if (typeof document !== 'undefined') {
+      const show = (id, on) => {
+        const el = document.getElementById(id);
+        if (el) el.classList.toggle('visible', on);
+      };
+      show('title-screen', screen === 'title');
+      show('pause-screen', screen === 'pause');
+      show('gameover-screen', screen === 'busted' || screen === 'wasted');
+      show('hud', screen === 'play' || screen === 'pause');
+      const title = document.getElementById('gameover-title');
+      const sub = document.getElementById('gameover-sub');
+      if (title) title.textContent = screen === 'busted' ? 'BUSTED' : 'WASTED';
+      if (sub) sub.textContent = screen === 'busted' ? 'The law caught up with Mara' : 'Mara is down — the crew drags her to the clinic';
+      const cont = document.getElementById('btn-continue');
+      if (cont && screen === 'title') cont.disabled = !save.hasSave();
+    }
   }
-  function frame(nowMs) { rafId = requestAnimationFrame(frame);
-    const realDt = Math.min( (nowMs - lastFrameMs) / 1000 || 0, GAME_CONFIG.maxFrameDt, );
-    lastFrameMs = nowMs;
-    if (!world.paused) { accumulator += realDt;
+
+  function handleScreenEvents(drained) {
+    for (const ev of drained) {
+      if (ev.type === 'busted') setScreen('busted');
+      else if (ev.type === 'player-down') setScreen('wasted');
+    }
+  }
+
+  function drainEvents() {
+    const drained = events.drain();
+    const handlers = [missions, vehicles, traffic, pedestrians, police, combat, audio, hud, save];
+    for (const mod of handlers) {
+      if (typeof mod.handleEvents === 'function') {
+        try { mod.handleEvents(world, drained); } catch (err) { /* one module must not kill the tick */ }
+      }
+    }
+    handleScreenEvents(drained);
+  }
+
+  function tick(dt) {
+    // Mouse look orbits the camera; on-foot movement and aiming are both
+    // relative to this yaw — vehicles.js reads it as world.cameraYaw.
+    // (The chase camera while driving follows the car heading instead,
+    // inside render.js, so yaw is untouched there.)
+    const look = inputMod.getLookDelta(input);
+    // Mouse right turns the view right: yaw grows with positive look dx,
+    // matching the forward vector (sin yaw, -cos yaw) the player walks along.
+    cameraState.yaw += look.dx * 0.0032;
+    cameraState.pitch = Math.max(-0.1, Math.min(1.2, cameraState.pitch + look.dy * 0.0022));
+    world.cameraYaw = cameraState.yaw;
+
+    inputMod.updateInput(input);
+    if (shots.isShotMode && shots.isShotMode()) shots.updateAutopilot(world, dt);
+    missions.updateMission(world, dt);
+    vehicles.updateVehicles(world, dt, input);
+    traffic.updateTraffic(world, dt);
+    pedestrians.updatePedestrians(world, dt);
+    police.updatePolice(world, dt);
+    combat.updateCombat(world, dt);
+    audio.updateAudio(world, dt);
+    hud.updateHud(world, dt);
+    save.autosaveIfDue(world, dt);
+
+    world.tick += 1;
+    world.clock += dt;
+    world.timeOfDay = (GAME_CONFIG.dayStartHour + world.clock * GAME_CONFIG.clockHoursPerSim) % 24;
+
+    // Camera mode follows screen and player state.
+    if (world.screen === 'title') cameraState.mode = 'title';
+    else if (world.player.onFoot) cameraState.mode = 'foot';
+    else cameraState.mode = 'chase';
+    render.setCameraMode(cameraState.mode);
+    drainEvents();
+  }
+
+  function renderFrame() {
+    render.renderWorld(world, cameraState);
+    firstFrameDone = true;
+    if (shots.isShotMode && shots.isShotMode() && typeof shots.updateShotReadiness === 'function') {
+      shots.updateShotReadiness(world);
+    }
+  }
+
+  function frame(nowMs) {
+    if (!running) return;
+    rafId = requestAnimationFrame(frame);
+    const now = nowMs || 0;
+    // Clamp wall-time stalls so a tab switch never fast-forwards the sim.
+    // This is the ONLY place real frame time is measured; it never advances
+    // game state directly — the fixed-step accumulator does that.
+    let realDt = lastFrameMs ? (now - lastFrameMs) / 1000 : STEP;
+    lastFrameMs = now;
+    if (!Number.isFinite(realDt) || realDt < 0) realDt = 0;
+    if (realDt > GAME_CONFIG.maxFrameDt) realDt = GAME_CONFIG.maxFrameDt;
+    if (world.screen === 'play' && !world.paused) {
+      accumulator += realDt;
       let steps = 0;
-      while (accumulator >= GAME_CONFIG.step && steps < GAME_CONFIG.maxStepsPerFrame) { step();
-        accumulator -= GAME_CONFIG.step;
-        steps++;
+      while (accumulator >= STEP && steps < GAME_CONFIG.maxStepsPerFrame) {
+        tick(STEP);
+        accumulator -= STEP;
+        steps += 1;
       }
       if (steps === GAME_CONFIG.maxStepsPerFrame) accumulator = 0;
-    } else if (currentGame) { inputSlot(world, GAME_CONFIG.step);
-    }
-    renderFrame(world);
-    if (typeof window !== 'undefined' && isShotMode() && countShotFrame()) markShotReady();
-    if (!firstFrameDone) { firstFrameDone = true;
-      if (typeof performance !== 'undefined' && performance.now() - bootMs > GAME_CONFIG.renderWatchdogSeconds * 1000) { watchdogFired = true;
-        render.enableFallback();
+    } else if (world.screen === 'title') {
+      // Title keeps the city alive behind the menu: slow ambient steps.
+      accumulator += realDt;
+      let steps = 0;
+      while (accumulator >= STEP && steps < 2) {
+        world.tick += 1;
+        world.clock += STEP;
+        world.timeOfDay = (GAME_CONFIG.dayStartHour + world.clock * GAME_CONFIG.clockHoursPerSim) % 24;
+        traffic.updateTraffic(world, STEP);
+        pedestrians.updatePedestrians(world, STEP);
+        accumulator -= STEP;
+        steps += 1;
       }
     }
+    renderFrame();
   }
-  const game = { world, events, input, hud, renderer, camera: currentCamera, start() { lastFrameMs = typeof performance !== 'undefined' ? performance.now() : 0;
-      rafId = requestAnimationFrame(frame);
-      if (typeof document !== 'undefined') { document.addEventListener('visibilitychange', onVisibilityHidden);
-      }
-    }, stop() { cancelAnimationFrame(rafId);
-      if (typeof document !== 'undefined') { document.removeEventListener('visibilitychange', onVisibilityHidden);
-      }
-    }, step, tick: (dt) => tick(world, dt), setScreen: (screen) => setScreen(world, screen), };
-  currentGame = game;
-  return game;
-}
-export function tick(world, dt) { world.timeOfDay = (GAME_CONFIG.timeOfDayStart + world.clock * GAME_CONFIG.timeOfDayRate) % 24;
-  if (currentGame && isShotMode()) updateAutopilot(world, dt);
-  if (currentGame) { const emit = currentGame.events.emit;
-    inputSlot(world, dt);
-    missionSlot(world, dt);
-    updateVehicles(world, dt, activeInput(), emit);
-    updateTraffic(world, dt, emit);
-    updatePedestrians(world, dt, emit);
-    updatePolice(world, dt, emit);
-    combatSlot(world, dt);
-    updateAudio(world, dt);
-    updateHud(currentGame.hud, world, dt);
-    autosaveIfDue(world, dt);
-  }
-  if (currentGame) { const drained = currentGame.events.drain();
-    for (const e of drained) { if (e.type === 'busted' && world.screen === 'play') { setScreen(world, 'busted');
-      } else if (e.type === 'player-down' && world.screen === 'play') { setScreen(world, 'wasted');
-      }
-      routeEvent(world, e);
+
+  function start() {
+    if (running) return;
+    running = true;
+    lastFrameMs = 0;
+    accumulator = 0;
+    rafId = requestAnimationFrame(frame);
+    if (typeof window !== 'undefined') {
+      window.setTimeout(() => {
+        if (!firstFrameDone && !watchdogFired) {
+          watchdogFired = true;
+          render.enableFallback();
+        }
+      }, GAME_CONFIG.renderWatchdogMs);
     }
   }
-  if (currentGame) currentGame.events.setTick(world.tick);
-}
-let currentGame = null;
-export function renderFrame(world) { const view = { ...currentCamera };
-  if (world.screen === 'title') view.mode = 'title';
-  else if (world.player.onFoot) view.mode = 'foot';
-  else view.mode = 'chase';
-  render.renderWorld(world, view);
-}
-export function setScreen(world, screen) { world.screen = screen;
-  world.paused = screen !== 'play';
-  if (screen !== 'play' && typeof document !== 'undefined' && document.pointerLockElement) { try { document.exitPointerLock(); } catch (err) {  }
+
+  function stop() {
+    running = false;
+    if (rafId) cancelAnimationFrame(rafId);
+    rafId = 0;
   }
-  if (screen === 'title') { currentCamera.mode = 'title';
-    render.setCameraMode('title');
-  } else if (screen === 'play') { render.setCameraMode(world.player.onFoot ? 'foot' : 'chase');
+
+  function onVisibilityHidden() {
+    if (world.screen === 'play') setScreen('pause');
   }
-  if (currentGame) currentGame.events.emit('screen-changed', { screen });
-  updateScreenDom(screen);
+
+  return { world, events, cameraState, input, start, stop, setScreen, tick, renderFrame, onVisibilityHidden };
 }
-export function updateScreenDom(screen) { if (typeof document === 'undefined') return;
-  const show = (id, visible) => { const el = document.getElementById(id);
-    if (el) el.classList.toggle('hidden', !visible);
+
+export function boot() {
+  if (typeof window !== 'undefined') {
+    window.__shotReady = false;
+    window.__shot = '';
+    window.__renderMode = 'webgl';
+  }
+  const canvas = document.getElementById('game-canvas');
+  const params = new URLSearchParams(window.location.search);
+  const renderParam = params.get('render');
+  if (renderParam === 'canvas2d' && typeof render.forceFallbackForTests === 'function') {
+    render.forceFallbackForTests();
+  }
+  const game = createGame(canvas, { params });
+  const world = game.world;
+  window.__game = game; // test/debug handle (smoke test + shots read state here)
+
+  render.createRenderer(canvas);
+  render.resize(window.innerWidth, window.innerHeight);
+  spawnWorld(world);
+
+  const shot = params.get('shot');
+  if (shot) {
+    window.__shot = shot;
+    if (typeof shots.parseShotParams === 'function') {
+      const parsed = shots.parseShotParams(window.location.search);
+      shots.stageShot(world, parsed);
+    }
+  }
+  if (typeof hud.createHud === 'function') hud.createHud(document);
+
+  // First user gesture unlocks audio (browsers require it).
+  const unlock = () => {
+    if (typeof audio.initAudio === 'function') audio.initAudio();
+    if (typeof audio.startMusic === 'function') audio.startMusic();
   };
-  show('title-screen', screen === 'title');
-  show('pause-screen', screen === 'pause');
-  show('gameover-screen', screen === 'busted' || screen === 'wasted');
-  show('hud', screen === 'play');
-  if (screen === 'title') { const cont = document.getElementById('btn-continue');
-    if (cont) { try { cont.disabled = !hasSave(); } catch (err) { cont.disabled = true; }
-    }
+  document.addEventListener('pointerdown', unlock, { once: true });
+  document.addEventListener('keydown', unlock, { once: true });
+
+  // Request pointer lock without ever surfacing a console error: the
+  // browser refuses a re-lock for ~1.25 s after an exit, and that
+  // rejection must not become an uncaught promise error.
+  function lockPointer() {
+    if (!canvas || !canvas.requestPointerLock) return;
+    try {
+      const result = canvas.requestPointerLock();
+      if (result && typeof result.catch === 'function') result.catch(() => {});
+    } catch (err) { /* lock refused; a canvas click re-locks */ }
   }
-  const title = document.getElementById('gameover-title');
-  if (title) { title.textContent = screen === 'busted' ? 'BUSTED' : screen === 'wasted' ? 'WASTED' : '';
-  }
-  const sub = document.getElementById('gameover-sub');
-  if (sub && (screen === 'busted' || screen === 'wasted')) { sub.textContent = screen === 'busted'
-      ? 'The police took you in. You lost the fine.'
-      : 'Mara is down. The clinic patches her up.';
-  }
-}
-export function onVisibilityHidden() { if (typeof document === 'undefined') return;
-  if (document.hidden && currentGame && currentGame.world.screen === 'play') { setScreen(currentGame.world, 'pause');
-  }
-}
-function readParams() { const params = new URLSearchParams(window.location.search);
-  const seedRaw = parseInt(params.get('seed') || '1', 10);
-  return { seed: Number.isFinite(seedRaw) ? seedRaw : 1,
-    shot: params.get('shot') || null, render: params.get('render') || null, scene: params.get('scene') || null, };
-}
-export function boot() { const canvas = document.getElementById('game-canvas');
-  const params = readParams();
-  const game = createGame(canvas, { seed: params.seed });
-  currentGame = game;
-  if (typeof window !== 'undefined') window.__game = game;
-  window.__shotReady = false;
-  window.__shot = params.shot || params.scene || null;
-  window.__renderMode = render.getRenderMode();
-  if (params.render === 'canvas2d') render.enableFallback();
-  const bind = (id, fn) => { const el = document.getElementById(id);
-    if (el) el.addEventListener('click', () => { playSfx('ui-click'); fn(); });
+
+  // Menu wiring.
+  const on = (id, fn) => {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener('click', fn);
   };
-  const newGame = () => { clearSave();
-    resetForNewGame(game.world);
-    setScreen(game.world, 'play');
-  };
-  const retry = () => retryFlow(game.world);
-  const freeroam = () => freeroamFlow(game.world);
-  [ ['btn-new', newGame], ['btn-continue', () => { if (applySaveToWorld(game.world, loadGame())) { setMuted(!!game.world.muted);
-        syncMuteLabel(game.world);
-        setScreen(game.world, 'play');
-      }
-    }], ['btn-help', () => toggleHelp(true)], ['btn-help-close', () => toggleHelp(false)], ['btn-mute', () => toggleMute(game.world)],
-    ['btn-resume', () => setScreen(game.world, 'play')], ['btn-help-pause', () => toggleHelp(true)],
-    ['btn-quit', () => { saveGame(game.world); setScreen(game.world, 'title'); }], ['btn-retry', retry],
-    ['btn-freeroam', freeroam], ['btn-title', () => { saveGame(game.world); setScreen(game.world, 'title'); }], ].forEach(([id, fn]) => bind(id, fn));
   const seedLine = document.getElementById('seed-line');
-  if (seedLine) seedLine.textContent = 'Seed ' + params.seed;
-  const continueBtn = document.getElementById('btn-continue');
-  if (continueBtn) { try { continueBtn.disabled = !hasSave();
-    } catch (err) { continueBtn.disabled = true;
+  if (seedLine) seedLine.textContent = 'Seed ' + world.seed;
+  on('btn-new-game', () => {
+    world.player.pos = { x: -222, y: 0, z: 96 };
+    world.player.health = 100;
+    world.player.cash = 0;
+    world.player.onFoot = true;
+    world.player.vehicleId = null;
+    police.clearWanted(world);
+    game.setScreen('play');
+    lockPointer();
+  });
+  on('btn-continue', () => {
+    const saved = save.loadGame();
+    if (saved) {
+      world.player.cash = saved.cash || 0;
+      world.player.health = (saved.player && saved.player.health) || 100;
+      world.player.ammo = (saved.player && saved.player.ammo) || 0;
+      world.player.weapon = (saved.player && saved.player.weapon) || 'fists';
+      if (saved.flags) world.flags = Object.assign(world.flags, saved.flags);
+      if (saved.stats) world.stats = Object.assign(world.stats, saved.stats);
+      world.player.pos = { x: -222, y: 0, z: 96 };
+      world.player.onFoot = true;
+      game.setScreen('play');
+      lockPointer();
     }
-  }
-  try { const saved = loadGame();
-    if (saved && saved.muted) { setMuted(true);
-      game.world.muted = true;
-      syncMuteLabel(game.world);
+  });
+  on('btn-howto', () => {
+    const help = document.getElementById('help-panel');
+    if (help) help.classList.add('visible');
+  });
+  on('btn-pause-howto', () => {
+    const help = document.getElementById('help-panel');
+    if (help) help.classList.add('visible');
+  });
+  on('btn-close-help', () => {
+    const help = document.getElementById('help-panel');
+    if (help) help.classList.remove('visible');
+  });
+  let muted = false;
+  const toggleMute = () => {
+    muted = !muted;
+    if (typeof audio.setMuted === 'function') audio.setMuted(muted);
+    const btn = document.getElementById('btn-mute');
+    if (btn) btn.textContent = 'Mute: ' + (muted ? 'On' : 'Off');
+    return muted;
+  };
+  on('btn-mute', toggleMute);
+  on('btn-resume', () => {
+    game.setScreen('play');
+    lockPointer();
+  });
+  on('btn-save-quit', () => {
+    save.saveGame(world);
+    game.setScreen('title');
+  });
+  on('btn-retry', () => {
+    world.player.health = 100;
+    world.player.pos = { x: -222, y: 0, z: 96 };
+    world.player.onFoot = true;
+    world.player.vehicleId = null;
+    police.clearWanted(world);
+    game.setScreen('play');
+  });
+  on('btn-freeroam', () => {
+    world.mission.activeId = null;
+    world.mission.objectives = [];
+    world.player.health = 100;
+    world.player.pos = { x: -222, y: 0, z: 96 };
+    world.player.onFoot = true;
+    police.clearWanted(world);
+    game.setScreen('play');
+  });
+  on('btn-to-title', () => game.setScreen('title'));
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) game.onVisibilityHidden();
+  });
+  // In a real browser Esc exits pointer lock without delivering the key,
+  // so losing the lock while playing is itself the pause signal.
+  // (The guard means the exitPointerLock in setScreen never re-triggers this.)
+  document.addEventListener('pointerlockchange', () => {
+    if (!document.pointerLockElement && world.screen === 'play') game.setScreen('pause');
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.code === 'Escape' || e.code === 'KeyP') {
+      if (world.screen === 'play') game.setScreen('pause');
+      else if (world.screen === 'pause') game.setScreen('play');
+    } else if (e.code === 'Enter' && world.screen === 'title') {
+      document.getElementById('btn-new-game').click();
+    } else if (e.code === 'F1') {
+      e.preventDefault();
+      const help = document.getElementById('help-panel');
+      if (help) help.classList.toggle('visible');
+    } else if (e.code === 'KeyM') {
+      toggleMute();
     }
-  } catch (err) {  }
-  if (params.shot === 'start') setScreen(game.world, 'title');
-  else if (params.shot === 'play') setScreen(game.world, 'play');
-  else if (params.shot === 'end') setScreen(game.world, 'busted');
-  else setScreen(game.world, 'title');
-  if (params.shot) { stageShot(game.world, { shot: params.shot, seed: params.seed, scene: params.scene, render: params.render, game, });
-  }
-  resizeToWindow();
-  window.addEventListener('resize', resizeToWindow);
+  });
+  window.addEventListener('resize', () => render.resize(window.innerWidth, window.innerHeight));
+
+  game.setScreen('title');
   game.start();
   return game;
 }
-function resizeToWindow() { render.resize(window.innerWidth, window.innerHeight);
-}
-function toggleHelp(showIt) { const panel = document.getElementById('help-panel');
-  if (panel) panel.classList.toggle('hidden', !showIt);
-}
-function toggleMute(world) { const mutedNow = setMuted(!isMuted());
-  world.muted = mutedNow;
-  syncMuteLabel(world);
-}
-function syncMuteLabel(world) { if (typeof document === 'undefined') return;
-  const btn = document.getElementById('btn-mute');
-  if (btn) btn.textContent = world.muted ? 'Sound: Muted' : 'Sound: On';
-}
-function resetForNewGame(world) { const keepMuted = world.muted;
-  const fresh = createWorld(world.seed);
-  for (const key of Object.keys(world)) delete world[key];
-  Object.assign(world, fresh);
-  world.muted = keepMuted;
-  currentCamera.mode = 'foot';
-  currentCamera.yaw = 0;
-  currentCamera.pitch = 0.1;
-}
-function retryFlow(world) { const game = currentGame;
-  const emit = game ? game.events.emit : null;
-  respawn(world);
-  if (world.mission.lastFailed) { retryMission(world, emit);
-  } else if (world.mission.activeId) { const id = world.mission.activeId;
-    const stage = world.mission.stage;
-    world.mission.activeId = null;
-    world.mission.objectives = [];
-    startMission(world, id, emit, stage);
-  }
-  setScreen(world, 'play');
-}
-function freeroamFlow(world) { const game = currentGame;
-  const emit = game ? game.events.emit : null;
-  if (world.mission.activeId) failMission(world, 'Left the job', emit);
-  world.mission.lastFailed = null;
-  respawn(world);
-  setScreen(world, 'play');
-}
-function respawn(world) { world.player.pos = { x: -252, y: 0, z: -120 };
-  world.player.heading = Math.PI / 2;
-  world.player.health = 100;
-  world.player.onFoot = true;
-  world.player.vehicleId = null;
-  world.player.isAiming = false;
-  world.player.wantedHeat = 0;
-  world.police.heat = 0;
-  world.police.wanted = 0;
-  world.police.bustTimer = 0;
-  world.police.escapeTimer = 0;
-  world.mission.timer = null;
-}
-if (typeof document !== 'undefined') { boot();
+
+if (typeof document !== 'undefined' && document.getElementById('game-canvas')) {
+  boot();
 }

@@ -1,116 +1,204 @@
+// save.js — persistence for Solmar Bay (W4).
+// The ONLY module that touches localStorage. Key 'solmar-bay-save-v1'.
+// Shape is DESIGN §5.1: version 1, seed, cash, missionsDone (array),
+// activeMission, flags, player, stats, muted, savedClock in SIM seconds.
+// loadGame() rejects version !== 1 or bad field types and returns null.
+// Storage failures are swallowed: saveGame() returns false, the game keeps
+// an in-memory copy, and save.saveUnavailable flags the HUD warning.
+
 export const SAVE_KEY = 'solmar-bay-save-v1';
-export const SAVE_VERSION = 1;
-export const AUTOSAVE_INTERVAL = 30;
-const SAFEHOUSE_FALLBACK = { x: -252, z: -120 };
-let _memoryCopy = null;
-let _saveUnavailable = false;
-let _lastAutosaveClock = 0;
-let _lastCmpJson = '';
-const _isBool = (v) => typeof v === 'boolean';
-const _isNum = (v) => typeof v === 'number' && isFinite(v);
-const _isStr = (v) => typeof v === 'string';
-function _storage() { try { return (typeof localStorage === 'undefined' || localStorage === null)
-      ? null : localStorage;
-  } catch (e) { return null; }
+export const AUTOSAVE_INTERVAL = 30; // sim seconds between autosaves
+
+// HUD reads this flag to show "Save unavailable — progress kept for this
+// session" once (see hud.js / main.js). lastSavedClock is the sim clock of
+// the last successful write, so the HUD can show a "Saved" note.
+export const save = { saveUnavailable: false, lastSavedClock: 0 };
+
+let memoryCopy = null;
+let autosaveClock = 0;
+
+function storage() {
+  try {
+    if (typeof localStorage === 'undefined') return null;
+    return localStorage;
+  } catch (err) {
+    return null;
+  }
 }
-export function getSafehousePos(world) { const districts = world && world.city && world.city.districts;
-  if (districts) { for (let i = 0; i < districts.length; i++) { const d = districts[i];
-      if (d.name === 'Marina Quarter') { return { x: (d.x0 + d.x1) / 2, z: (d.z0 + d.z1) / 2 };
-      }
+
+function isNum(v) {
+  return typeof v === 'number' && Number.isFinite(v);
+}
+
+function isBool(v) {
+  return typeof v === 'boolean';
+}
+
+function isStr(v) {
+  return typeof v === 'string';
+}
+
+function validFlags(f) {
+  return f && typeof f === 'object'
+    && isBool(f.metRosa) && isBool(f.harbourOpen) && isBool(f.ownsPistol);
+}
+
+function validPlayer(p) {
+  return p && typeof p === 'object'
+    && isNum(p.health) && isNum(p.armour)
+    && isStr(p.weapon) && isNum(p.ammo);
+}
+
+function validStats(s) {
+  return s && typeof s === 'object'
+    && isNum(s.carsStolen) && isNum(s.distanceDriven)
+    && isNum(s.copsEvaded) && isNum(s.shotsFired) && isNum(s.bestCash);
+}
+
+export function validateSave(data) {
+  if (!data || typeof data !== 'object') return false;
+  if (data.version !== 1) return false;
+  if (!isNum(data.seed) || !isNum(data.cash)) return false;
+  if (!Array.isArray(data.missionsDone)
+    || !data.missionsDone.every(isStr)) return false;
+  if (data.activeMission !== null && !isStr(data.activeMission)) return false;
+  if (!validFlags(data.flags)) return false;
+  if (!validPlayer(data.player)) return false;
+  if (!validStats(data.stats)) return false;
+  if (!isBool(data.muted) || !isNum(data.savedClock)) return false;
+  return true;
+}
+
+export function buildSaveData(world) {
+  const done = Array.isArray(world.mission.doneIds)
+    ? [...world.mission.doneIds] : [];
+  return {
+    version: 1,
+    seed: world.seed,
+    cash: world.player.cash,
+    missionsDone: done,
+    activeMission: world.mission.activeId || null,
+    flags: {
+      metRosa: !!world.flags.metRosa,
+      harbourOpen: !!world.flags.harbourOpen,
+      ownsPistol: !!world.flags.ownsPistol,
+      debtCleared: !!world.flags.debtCleared,
+    },
+    player: {
+      health: world.player.health,
+      armour: world.player.armour,
+      weapon: world.player.weapon,
+      ammo: world.player.ammo,
+    },
+    stats: {
+      carsStolen: world.stats.carsStolen,
+      distanceDriven: world.stats.distanceDriven,
+      copsEvaded: world.stats.copsEvaded,
+      shotsFired: world.stats.shotsFired,
+      bestCash: world.stats.bestCash,
+    },
+    muted: !!world.muted,
+    savedClock: world.clock,
+  };
+}
+
+export function saveGame(world) {
+  const data = buildSaveData(world);
+  memoryCopy = data;
+  const store = storage();
+  if (!store) {
+    save.saveUnavailable = true;
+    return false;
+  }
+  try {
+    store.setItem(SAVE_KEY, JSON.stringify(data));
+  } catch (err) {
+    save.saveUnavailable = true;
+    return false;
+  }
+  save.saveUnavailable = false;
+  save.lastSavedClock = data.savedClock;
+  world.saveDirty = false;
+  return true;
+}
+
+// Mark the world dirty so the next autosave window (or a forced save)
+// persists it. Used by missions on completion and by main on pause.
+export function markSaveDirty(world) {
+  world.saveDirty = true;
+}
+
+export function loadGame() {
+  const store = storage();
+  let raw = null;
+  if (store) {
+    try {
+      raw = store.getItem(SAVE_KEY);
+    } catch (err) {
+      raw = null;
     }
   }
-  return { x: SAFEHOUSE_FALLBACK.x, z: SAFEHOUSE_FALLBACK.z };
-}
-export function buildSaveData(world) { const p = world.player || {};
-  const s = world.stats || {};
-  const f = world.flags || {};
-  const m = world.mission || {};
-  return { version: SAVE_VERSION, seed: _isNum(world.seed) ? world.seed : 1, cash: _isNum(p.cash) ? Math.floor(p.cash) : 0,
-    missionsDone: Array.isArray(m.doneIds) ? m.doneIds.slice() : [], activeMission: m.activeId || null,
-    flags: { metRosa: !!f.metRosa, harbourOpen: !!f.harbourOpen, ownsPistol: !!f.ownsPistol,
-      debtCleared: !!f.debtCleared, }, player: { health: _isNum(p.health) ? Math.round(p.health) : 100,
-      armour: _isNum(p.armour) ? Math.round(p.armour) : 0, weapon: _isStr(p.weapon) ? p.weapon : 'fists',
-      ammo: _isNum(p.ammo) ? Math.floor(p.ammo) : 0, }, stats: { carsStolen: _isNum(s.carsStolen) ? s.carsStolen : 0,
-      distanceDriven: _isNum(s.distanceDriven) ? Math.round(s.distanceDriven) : 0,
-      copsEvaded: _isNum(s.copsEvaded) ? s.copsEvaded : 0, shotsFired: _isNum(s.shotsFired) ? s.shotsFired : 0,
-      bestCash: _isNum(s.bestCash) ? Math.floor(s.bestCash) : 0, }, muted: !!world.muted, savedClock: _isNum(world.clock) ? Math.floor(world.clock) : 0, };
-}
-const _nums = (o, ks) => !!o && ks.every((k) => _isNum(o[k]));
-const _bools = (o, ks) => !!o && ks.every((k) => _isBool(o[k]));
-export function validateSave(d) { if (!d || typeof d !== 'object' || d.version !== SAVE_VERSION) return null;
-  if (!_isNum(d.seed) || !_isNum(d.cash) || !Array.isArray(d.missionsDone)) return null;
-  if (d.missionsDone.some((m) => !_isStr(m))) return null;
-  if (d.activeMission !== null && !_isStr(d.activeMission)) return null;
-  if (!_bools(d.flags, ['metRosa', 'harbourOpen', 'ownsPistol'])) return null;
-  if (!_nums(d.player, ['health', 'armour', 'ammo']) || !_isStr(d.player.weapon)) return null;
-  if (!_nums(d.stats, ['carsStolen', 'distanceDriven', 'copsEvaded', 'shotsFired', 'bestCash'])) return null;
-  if (!_isBool(d.muted) || !_isNum(d.savedClock)) return null;
-  return d;
-}
-export function saveGame(world) { let data;
-  try { data = buildSaveData(world); } catch (e) { return false; }
-  const json = JSON.stringify(data);
-  _memoryCopy = json;
-  _lastCmpJson = JSON.stringify({ ...data, savedClock: 0 });
-  _lastAutosaveClock = world.clock || 0;
-  const store = _storage();
-  if (!store) { _saveUnavailable = true; return false; }
-  try { store.setItem(SAVE_KEY, json); } catch (e) { _saveUnavailable = true;
-    return false;
+  if (raw === null || raw === undefined) {
+    return memoryCopy && validateSave(memoryCopy) ? memoryCopy : null;
   }
-  return true;
-}
-export function loadGame() { const store = _storage();
-  let json = null;
-  if (store) { try { json = store.getItem(SAVE_KEY); } catch (e) { json = null; }
-    if (json == null) return null;
-  } else { json = _memoryCopy;
-    if (json == null) return null;
+  let data = null;
+  try {
+    data = JSON.parse(raw);
+  } catch (err) {
+    return null;
   }
-  let data;
-  try { data = JSON.parse(json); } catch (e) { return null; }
-  return validateSave(data);
+  if (!validateSave(data)) return null;
+  memoryCopy = data;
+  return data;
 }
-export function hasSave() { return loadGame() !== null; }
-export function clearSave() { _memoryCopy = null;
-  _lastCmpJson = '';
-  const store = _storage();
-  if (store) { try { store.removeItem(SAVE_KEY); } catch (e) {  }
+
+export function clearSave() {
+  memoryCopy = null;
+  const store = storage();
+  if (!store) return;
+  try {
+    store.removeItem(SAVE_KEY);
+  } catch (err) {
+    // Swallowed: a missing store is not a game error.
   }
 }
-export function applySaveToWorld(world, saved) { const data = saved || loadGame();
-  if (!data) return false;
-  if (!world.player) world.player = {};
-  if (!world.stats) world.stats = {};
-  if (!world.flags) world.flags = {};
-  if (!world.mission) world.mission = {};
-  if (!world.police) world.police = {};
-  world.seed = data.seed;
-  const safe = getSafehousePos(world);
-  Object.assign(world.player, { cash: data.cash, health: data.player.health, armour: data.player.armour,
-    weapon: data.player.weapon, ammo: data.player.ammo, onFoot: true,
-    vehicleId: null, wantedHeat: 0, heading: 0, speed: 0, pos: { x: safe.x, y: 0, z: safe.z }, });
-  Object.assign(world.mission, { doneIds: data.missionsDone.slice(), activeId: null, stage: 0, objectives: [], briefing: '', timer: null, reward: 0, });
-  Object.assign(world.flags, { metRosa: data.flags.metRosa, harbourOpen: data.flags.harbourOpen,
-    ownsPistol: data.flags.ownsPistol, debtCleared: !!data.flags.debtCleared, });
-  Object.assign(world.stats, { carsStolen: data.stats.carsStolen, distanceDriven: data.stats.distanceDriven,
-    copsEvaded: data.stats.copsEvaded, shotsFired: data.stats.shotsFired, bestCash: data.stats.bestCash, });
-  Object.assign(world.police, { wanted: 0, heat: 0, escapeTimer: 0, bustTimer: 0 });
-  world.muted = data.muted;
-  return true;
-}
-export function autosaveIfDue(world, dt) { if (!world || world.screen === 'title') return false;
-  const clock = world.clock || 0;
-  if (clock - _lastAutosaveClock < AUTOSAVE_INTERVAL) return false;
-  let data;
-  try { data = buildSaveData(world); } catch (e) { return false; }
-  if (JSON.stringify({ ...data, savedClock: 0 }) === _lastCmpJson) { _lastAutosaveClock = clock;
-    return false;
+
+export function hasSave() {
+  const store = storage();
+  if (store) {
+    try {
+      if (store.getItem(SAVE_KEY) !== null) return true;
+    } catch (err) {
+      // Fall through to the in-memory copy.
+    }
   }
-  return saveGame(world);
+  return memoryCopy !== null;
 }
-export function _resetAutosaveForTests() { _lastAutosaveClock = 0;
-  _lastCmpJson = '';
-  _memoryCopy = null;
-  _saveUnavailable = false;
+
+// Called once per fixed step by main.js. Autosaves every 30 sim seconds
+// when the world is dirty; pass force=true on pause / mission completion.
+export function autosaveIfDue(world, dt, force) {
+  autosaveClock += dt;
+  if (force) {
+    autosaveClock = 0;
+    return saveGame(world);
+  }
+  if (world.saveDirty && autosaveClock >= AUTOSAVE_INTERVAL) {
+    autosaveClock = 0;
+    return saveGame(world);
+  }
+  return false;
+}
+
+// Events drained by main.js after each fixed step. Mission completion and
+// pausing save immediately, on top of the 30-second autosave window.
+export function handleEvents(world, events) {
+  for (const event of events) {
+    if (event.type === 'mission-done') {
+      saveGame(world);
+    } else if (event.type === 'screen-changed'
+      && event.payload && event.payload.screen === 'pause') {
+      saveGame(world);
+    }
+  }
 }

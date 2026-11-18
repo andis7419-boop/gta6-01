@@ -1,200 +1,375 @@
+// combat.js — on-foot combat: fists, pistol, damage, health, enemy NPCs.
+// Plain trig on world positions only; no three.js, no DOM, no unseeded RNG.
+// All randomness comes from a seeded RNG kept on world.combat.
+
 import { createRng } from './random.js';
-import { addHeat, clearWanted } from './police.js';
-import { collidesBuilding, clampToCity } from './city.js';
-const PUNCH_R = 1.2, PUNCH_DMG = 12, PUNCH_CD = 0.5;
-const PISTOL_DMG = 34, PISTOL_CD = 0.25, PISTOL_R = 60;
-const MAG = 12, RELOAD_T = 1.2;
-const E_HP = 100, E_MIN = 0.8, E_MAX = 1.6, E_HIT = 0.3, E_BULLET = 120;
-const E_DMG = 12, E_CHASE = 2.2, E_RANGE = 25;
-const REGEN_D = 8, REGEN_R = 2, SCARE_R = 12, TOL_P = 1.0, TOL_C = 2.2;
-let _rt = null;
-function rt(w) { const s = (w && w.seed) || 1;
-  if (!_rt || _rt.w !== w || _rt.s !== s) _rt = { w, s, rng: createRng(s + 505),
-    seq: 0, punchCd: 0, shootCd: 0, reloadT: 0, reloading: false, mag: 0, reserve: 0, lastHurt: -100, pending: [] };
-  return _rt;
+import { damageVehicle } from './vehicles.js';
+
+const FIST_DAMAGE = 12;
+const FIST_COOLDOWN = 0.5; // s
+const FIST_RANGE = 1.2; // m
+const PISTOL_DAMAGE = 34;
+const PISTOL_COOLDOWN = 0.25; // s
+const PISTOL_RANGE = 60; // m
+const PISTOL_CORRIDOR = 1.5; // m half-width of the aim corridor
+const MAG_SIZE = 12;
+const RELOAD_TIME = 1.2; // s
+const ENEMY_HEALTH = 100;
+const ENEMY_SHOT_MIN = 0.8; // s between enemy shots
+const ENEMY_SHOT_MAX = 1.6; // s
+const ENEMY_HIT_AT_20M = 0.3;
+const ENEMY_DAMAGE = 8;
+const REGEN_DELAY = 8; // s without damage before regen starts
+const REGEN_RATE = 2; // health/s
+const PICKUP_RADIUS = 1.6; // m
+const HEALTH_PICKUP_AMOUNT = 40;
+
+function _combat(world) {
+  if (!world.combat) {
+    world.combat = {
+      punchCooldown: 0,
+      shootCooldown: 0,
+      reloading: false,
+      reloadTimer: 0,
+      lastDamageAt: -1000,
+      magAmmo: MAG_SIZE,
+      enemies: [],
+      bullets: [],
+      pickups: [],
+      nextEnemyId: 1,
+      nextPickupId: 1,
+      clinicSpawned: false,
+    };
+  }
+  const c = world.combat;
+  if (!c.rng) c.rng = createRng((world.seed || 1) + 404);
+  if (!Array.isArray(c.enemies)) c.enemies = [];
+  if (!Array.isArray(c.bullets)) c.bullets = [];
+  if (!Array.isArray(c.pickups)) c.pickups = [];
+  return c;
 }
-function ev(emit, t, p) { if (typeof emit === 'function') emit(t, p); }
-function ensure(w) { if (!w.player) return false;
-  if (!Array.isArray(w.pedestrians)) w.pedestrians = [];
-  if (!Array.isArray(w.vehicles)) w.vehicles = [];
-  if (!w.police) w.police = { wanted: 0, heat: 0, officers: [], cars: [], escapeTimer: 0, bustTimer: 0 };
-  if (!Array.isArray(w.police.officers)) w.police.officers = [];
-  return true;
-}
-function syncAmmo(w) { const r = rt(w), total = w.player.ammo || 0;
-  if (r.mag + r.reserve !== total) { r.mag = Math.min(MAG, total); r.reserve = total - r.mag; r.reloading = false; }
-}
-function startReload(w) { const r = rt(w);
-  if (r.reloading || r.reserve <= 0) return false;
-  r.reloading = true; r.reloadT = RELOAD_T;
-  return true;
-}
-function scare(w, x, z, emit) { for (const p of w.pedestrians) { if (p.hostile || p.state === 'down' || p.state === 'flee') continue;
-    const dx = p.pos.x - x, dz = p.pos.z - z;
-    if (dx * dx + dz * dz <= SCARE_R * SCARE_R) { p.state = 'flee'; p.scared = true;
-      if (w.stats) w.stats.pedsScared = (w.stats.pedsScared || 0) + 1;
-      ev(emit, 'ped-scared', { pedId: p.id });
-    }
+
+function _emit(world, type, payload) {
+  if (world.events && typeof world.events.emit === 'function') {
+    world.events.emit(type, payload);
   }
 }
-export function punch(w, emit) { if (!ensure(w)) return false;
-  const r = rt(w), pl = w.player;
-  if (!pl.onFoot || r.punchCd > 0) return false;
-  r.punchCd = PUNCH_CD;
-  let best = null, bestD = PUNCH_R;
-  const near = (id, x, z) => { const d = Math.hypot(x - pl.pos.x, z - pl.pos.z);
-    if (d < bestD) { bestD = d; best = id; }
-  };
-  for (const p of w.pedestrians) if (p.state !== 'down') near(p.id, p.pos.x, p.pos.z);
-  for (const o of w.police.officers) near(o.id, o.pos.x, o.pos.z);
-  ev(emit, 'punch', { pos: { x: pl.pos.x, y: pl.pos.y, z: pl.pos.z } });
-  if (best) applyDamage(w, best, PUNCH_DMG, 'punch', emit);
-  scare(w, pl.pos.x, pl.pos.z, emit);
-  return true;
+
+function _playerPos(world) {
+  return world.player.pos;
 }
-export function shoot(w, tp, emit) { if (!ensure(w)) return false;
-  const r = rt(w), pl = w.player;
-  if (!pl.onFoot || pl.weapon !== 'pistol') return false;
-  syncAmmo(w);
-  if (r.reloading || r.shootCd > 0) return false;
-  if (r.mag <= 0) { startReload(w); return false; }
-  r.mag -= 1; pl.ammo -= 1; r.shootCd = PISTOL_CD;
-  if (w.stats) w.stats.shotsFired = (w.stats.shotsFired || 0) + 1;
-  ev(emit, 'shot-fired', { pos: { x: pl.pos.x, y: pl.pos.y, z: pl.pos.z } });
-  addHeat(w, 10, emit);
-  ev(emit, 'crime', { kind: 'shooting', amount: 10 });
-  scare(w, pl.pos.x, pl.pos.z, emit);
-  const hit = ray(w, pl.pos, tp, pl.heading);
-  if (hit) applyDamage(w, hit.id, PISTOL_DMG, 'shot', emit);
-  return true;
+
+// Aim ray: the player heading is the aim direction (vehicles aligns the
+// heading to the camera yaw while aiming). Returns the unit forward vector.
+function _aimDir(world) {
+  const h = world.player.heading || 0;
+  return { x: Math.sin(h), z: -Math.cos(h) };
 }
-function ray(w, from, tp, heading) { let dx, dz;
-  if (tp && typeof tp.x === 'number') { dx = tp.x - from.x; dz = tp.z - from.z; }
-  else { dx = Math.sin(heading); dz = -Math.cos(heading); }
-  const len = Math.hypot(dx, dz);
-  if (len < 0.01) return null;
-  dx /= len; dz /= len;
-  let best = null, bestT = PISTOL_R;
-  const consider = (id, x, z, tol) => { const rx = x - from.x, rz = z - from.z, t = rx * dx + rz * dz;
-    if (t <= 0 || t > bestT) return;
-    const px = rx - t * dx, pz = rz - t * dz;
-    if (px * px + pz * pz > tol * tol) return;
-    bestT = t; best = { id, dist: t };
-  };
-  for (const p of w.pedestrians) if (p.state !== 'down') consider(p.id, p.pos.x, p.pos.z, TOL_P);
-  for (const o of w.police.officers) consider(o.id, o.pos.x, o.pos.z, TOL_P);
-  for (const v of w.vehicles) if (v.state !== 'wrecked') consider(v.id, v.pos.x, v.pos.z, TOL_C);
-  return best;
+
+// Distance along the ray and perpendicular offset of point p from the ray
+// starting at origin with unit direction dir. Returns null if behind.
+function _rayHit(origin, dir, p) {
+  const dx = p.x - origin.x;
+  const dz = p.z - origin.z;
+  const along = dx * dir.x + dz * dir.z;
+  if (along < 0) return null;
+  const perpX = dx - dir.x * along;
+  const perpZ = dz - dir.z * along;
+  return { along, perp: Math.hypot(perpX, perpZ) };
 }
-export function applyDamage(w, target, amount, source, emit) { if (!w || !target || !(amount > 0) || !ensure(w)) return false;
-  const r = rt(w);
-  if (target === 'player') { const pl = w.player;
-    let rest = amount;
-    if (pl.armour > 0) { const a = Math.min(pl.armour, rest); pl.armour -= a; rest -= a; }
-    if (rest > 0) pl.health = Math.max(0, pl.health - rest);
-    r.lastHurt = w.clock || 0;
-    ev(emit, 'damage', { amount, source: source || 'unknown' });
-    if (pl.health <= 0) wasted(w, emit, amount, source);
-    return true;
-  }
-  for (const v of w.vehicles) { if (v.id === target) { v.health = Math.max(0, v.health - amount);
-      if (v.health <= 0) { v.state = 'wrecked';
-        if (w.player.vehicleId === v.id) { w.player.onFoot = true; w.player.vehicleId = null; w.player.speed = 0;
-        }
-      }
-      return true;
-    }
-  }
-  const cops = w.police.officers;
-  for (let i = 0; i < cops.length; i++) { if (cops[i].id === target) { const o = cops[i];
-      o.health = (o.health == null ? 100 : o.health) - amount;
-      if (o.health <= 0) { cops.splice(i, 1);
-        addHeat(w, 35, emit);
-        ev(emit, 'crime', { kind: 'cop-kill', amount: 35 });
-      }
-      return true;
-    }
-  }
-  for (const p of w.pedestrians) { if (p.id === target) { if (p.hostile) { p.health = (p.health == null ? E_HP : p.health) - amount;
-        if (p.health <= 0) { p.health = 0; p.state = 'down'; }
-      } else { p.state = 'down'; p.scared = true; }
-      return true;
-    }
-  }
-  return false;
+
+function _aliveEnemies(world) {
+  return _combat(world).enemies.filter((e) => e.health > 0 && e.state !== 'down');
 }
-function wasted(w, emit, amount, source) { const pl = w.player, cash = pl.cash || 0, f = Math.min(100, Math.floor(cash * 0.1));
-  if (f > 0) { pl.cash = cash - f; ev(emit, 'cash-changed', { cash: pl.cash, delta: -f }); }
-  const ds = w.city && w.city.districts, d = ds && ds.find(r => r.name === 'Marina Quarter');
-  pl.pos.x = d ? (d.x0 + d.x1) / 2 : 0; pl.pos.z = d ? (d.z0 + d.z1) / 2 + 12 : 12; pl.pos.y = 0;
-  pl.heading = 0; pl.speed = 0;
-  pl.health = 100; pl.onFoot = true; pl.vehicleId = null;
-  clearWanted(w, emit);
-  ev(emit, 'player-down', { amount: amount || 0, source: source || 'unknown', fine: f });
+
+export function enemyCount(world) {
+  return _aliveEnemies(world).length;
 }
-export function heal(w, amount, emit) { if (!w || !w.player || !(amount > 0)) return false;
-  w.player.health = Math.min(100, w.player.health + amount);
-  ev(emit, 'healed', { amount, source: 'pickup' });
-  return true;
-}
-export function spawnEnemies(w, x, z, count, emit) { if (!ensure(w)) return 0;
-  const r = rt(w);
-  let made = 0;
-  for (let i = 0; i < count; i++) { const a = r.rng.range(0, Math.PI * 2), d = r.rng.range(2, 9);
-    let px = x + Math.sin(a) * d, pz = z + Math.cos(a) * d;
-    if (w.city) { const s = clampToCity(w.city, px, pz); px = s.x; pz = s.z; }
-    w.pedestrians.push({ id: 'enemy-' + w.tick + '-' + (++r.seq), pos: { x: px, y: 0, z: pz }, heading: r.rng.range(0, Math.PI * 2), speed: 0,
-      state: 'hostile', colour: r.rng.pick([0x2b2b2b, 0x3a3a3a, 0x1a1a1a]),
-      shirtColour: r.rng.pick([0x8a2a2a, 0x2a2a8a, 0x3a3a3a]), walkPhase: 0, scared: false,
-      hostile: true, armed: true, health: E_HP, shootCooldown: r.rng.range(0.5, 1.5) });
-    made++;
+
+export function spawnEnemies(world, x, z, count) {
+  const c = _combat(world);
+  const made = [];
+  for (let i = 0; i < count; i++) {
+    const enemy = {
+      id: 'enemy-' + (c.nextEnemyId++),
+      pos: { x: x + c.rng.range(-4, 4), y: 0, z: z + c.rng.range(-4, 4) },
+      heading: c.rng.range(0, Math.PI * 2),
+      health: ENEMY_HEALTH,
+      state: 'alive',
+      // First shot comes soon, then every 0.8-1.6 s on the sim clock.
+      nextShotAt: world.clock + c.rng.range(0.4, 1.2),
+    };
+    c.enemies.push(enemy);
+    made.push(enemy);
   }
   return made;
 }
-export function enemyCount(w) { if (!w || !w.pedestrians) return 0;
-  let n = 0;
-  for (const p of w.pedestrians) if (p.hostile && p.state !== 'down') n++;
-  return n;
+
+// Health pickups (+40) for mission areas and the Marina clinic.
+export function spawnHealthPickup(world, x, z) {
+  const c = _combat(world);
+  const pickup = {
+    id: 'health-' + (c.nextPickupId++),
+    kind: 'health',
+    x,
+    z,
+    amount: HEALTH_PICKUP_AMOUNT,
+    taken: false,
+  };
+  c.pickups.push(pickup);
+  return pickup;
 }
-function updateEnemies(w, dt, emit) { const r = rt(w), pl = w.player;
-  for (const e of w.pedestrians) { if (!e.hostile || e.state === 'down') continue;
-    const dx = pl.pos.x - e.pos.x, dz = pl.pos.z - e.pos.z, d = Math.hypot(dx, dz) || 0.001;
-    e.heading = Math.atan2(dx, -dz);
-    if (d > E_RANGE) { e.speed = E_CHASE;
-      const step = E_CHASE * dt, nx = e.pos.x + (dx / d) * step, nz = e.pos.z + (dz / d) * step;
-      if (!w.city || !collidesBuilding(w.city, nx, nz, 0.6)) { e.pos.x = nx; e.pos.z = nz; }
-      e.walkPhase = (e.walkPhase || 0) + dt * 6;
-    } else if (d > 3) { e.speed = 0;
-      e.shootCooldown = (e.shootCooldown || 0) - dt;
-      if (e.shootCooldown <= 0) { e.shootCooldown = r.rng.range(E_MIN, E_MAX);
-        const blocked = w.city && collidesBuilding(w.city, (e.pos.x + pl.pos.x) / 2, (e.pos.z + pl.pos.z) / 2, 2);
-        if (!blocked) { const p = Math.max(0.05, Math.min(0.5, E_HIT * (20 / Math.max(d, 5))));
-          if (r.rng.chance(p)) r.pending.push({ timer: Math.max(0.05, d / E_BULLET), amount: E_DMG });
-          ev(emit, 'shot-fired', { pos: { x: e.pos.x, y: e.pos.y, z: e.pos.z } });
-        }
-      }
-    } else e.speed = 0;
+
+function _spawnClinicPickup(world) {
+  const c = _combat(world);
+  if (c.clinicSpawned) return;
+  c.clinicSpawned = true;
+  const districts = (world.city && world.city.districts) || [];
+  const marina = districts.find((d) => d.name === 'Marina Quarter');
+  if (marina) {
+    spawnHealthPickup(world, (marina.x0 + marina.x1) / 2, (marina.z0 + marina.z1) / 2);
   }
 }
-export function updateCombat(w, dt, emit) { if (!w || !w.player) return;
-  if (w.screen && w.screen !== 'play') return;
-  const r = rt(w);
-  ensure(w);
-  r.punchCd = Math.max(0, r.punchCd - dt);
-  r.shootCd = Math.max(0, r.shootCd - dt);
-  syncAmmo(w);
-  if (r.reloading) { r.reloadT -= dt;
-    if (r.reloadT <= 0) { r.reloading = false;
-      const t = Math.min(MAG - r.mag, r.reserve);
-      r.mag += t; r.reserve -= t;
+
+export function punch(world) {
+  const c = _combat(world);
+  if (world.player.onFoot === false) return false;
+  if (c.punchCooldown > 0) return false;
+  c.punchCooldown = FIST_COOLDOWN;
+  const origin = _playerPos(world);
+  _emit(world, 'punch', { pos: { x: origin.x, y: origin.y, z: origin.z } });
+  // Melee hits the closest living enemy inside the 1.2 m reach.
+  let best = null;
+  let bestDist = FIST_RANGE;
+  for (const enemy of _aliveEnemies(world)) {
+    const d = Math.hypot(enemy.pos.x - origin.x, enemy.pos.z - origin.z);
+    if (d <= bestDist) {
+      best = enemy;
+      bestDist = d;
     }
-  } else if (w.player.weapon === 'pistol' && r.mag <= 0 && r.reserve > 0) startReload(w);
-  const pl = w.player;
-  if (pl.health > 0 && pl.health < 100 && (w.clock || 0) - r.lastHurt > REGEN_D)
-    pl.health = Math.min(100, pl.health + REGEN_R * dt);
-  for (let i = r.pending.length - 1; i >= 0; i--) { const s = r.pending[i];
-    s.timer -= dt;
-    if (s.timer <= 0) { r.pending.splice(i, 1); applyDamage(w, 'player', s.amount, 'enemy-shot', emit); }
   }
-  updateEnemies(w, dt, emit);
+  if (best) {
+    applyDamage(world, best.id, FIST_DAMAGE, 'punch');
+    return true;
+  }
+  // No enemy in reach: a nearby pedestrian gets knocked down instead.
+  // That is a crime (hit-ped) — police hears about it via the event.
+  let ped = null;
+  let pedDist = FIST_RANGE;
+  for (const p of world.pedestrians || []) {
+    if (p.state === 'down') continue;
+    const d = Math.hypot(p.pos.x - origin.x, p.pos.z - origin.z);
+    if (d <= pedDist) {
+      ped = p;
+      pedDist = d;
+    }
+  }
+  if (ped) {
+    applyDamage(world, ped.id, FIST_DAMAGE, 'punch');
+    return true;
+  }
+  return true; // swung and missed; the punch still happened
+}
+
+export function reloadWeapon(world) {
+  const c = _combat(world);
+  if (c.reloading) return false;
+  if (c.magAmmo >= MAG_SIZE) return false;
+  if ((world.player.ammo || 0) <= 0) return false;
+  c.reloading = true;
+  c.reloadTimer = RELOAD_TIME;
+  return true;
+}
+
+export function shoot(world, targetPoint) {
+  const c = _combat(world);
+  if (!world.player.onFoot) return false;
+  if (world.player.weapon !== 'pistol') return false;
+  if (c.reloading) return false;
+  if (c.magAmmo <= 0) {
+    reloadWeapon(world); // dry magazine: start the reload even mid-cooldown
+    return false;
+  }
+  if (c.shootCooldown > 0) return false;
+  c.shootCooldown = PISTOL_COOLDOWN;
+  c.magAmmo -= 1;
+  if (world.stats) world.stats.shotsFired = (world.stats.shotsFired || 0) + 1;
+  const origin = _playerPos(world);
+  const dir = _aimDir(world);
+  _emit(world, 'shot-fired', { pos: { x: origin.x, y: origin.y, z: origin.z } });
+  _emit(world, 'crime', { kind: 'shooting', amount: 10 });
+
+  // Hitscan along the heading ray: first enemy, vehicle or pedestrian
+  // inside the 1.5 m corridor and 60 m range takes the round.
+  let bestAlong = PISTOL_RANGE;
+  let bestTarget = null; // { kind: 'enemy'|'vehicle'|'ped', id }
+  for (const enemy of _aliveEnemies(world)) {
+    const hit = _rayHit(origin, dir, enemy.pos);
+    if (hit && hit.perp <= PISTOL_CORRIDOR && hit.along <= bestAlong) {
+      bestAlong = hit.along;
+      bestTarget = { kind: 'enemy', id: enemy.id };
+    }
+  }
+  for (const v of world.vehicles || []) {
+    if (v.state === 'wrecked') continue;
+    const hit = _rayHit(origin, dir, v.pos);
+    if (hit && hit.perp <= PISTOL_CORRIDOR && hit.along <= bestAlong) {
+      bestAlong = hit.along;
+      bestTarget = { kind: 'vehicle', id: v.id };
+    }
+  }
+  for (const p of world.pedestrians || []) {
+    if (p.state === 'down') continue;
+    const hit = _rayHit(origin, dir, p.pos);
+    if (hit && hit.perp <= PISTOL_CORRIDOR && hit.along <= bestAlong) {
+      bestAlong = hit.along;
+      bestTarget = { kind: 'ped', id: p.id };
+    }
+  }
+  const end = {
+    x: origin.x + dir.x * bestAlong,
+    y: (origin.y || 0) + 1.3,
+    z: origin.z + dir.z * bestAlong,
+  };
+  // A short-lived tracer for render.js to draw; pure presentation data.
+  c.bullets.push({ from: { x: origin.x, y: (origin.y || 0) + 1.3, z: origin.z }, to: end, ttl: 0.08 });
+  if (bestTarget) applyDamage(world, bestTarget.id, PISTOL_DAMAGE, 'pistol');
+  return true;
+}
+
+// target: 'player' | vehicleId | pedId | enemyId.
+export function applyDamage(world, target, amount, source) {
+  const c = _combat(world);
+  if (target === 'player') {
+    const player = world.player;
+    if (player.health <= 0) return;
+    let remaining = amount;
+    if (player.armour > 0) {
+      const absorbed = Math.min(player.armour, remaining);
+      player.armour -= absorbed;
+      remaining -= absorbed;
+    }
+    player.health = Math.max(0, player.health - remaining);
+    c.lastDamageAt = world.clock;
+    _emit(world, 'damage', { amount, source: source || 'unknown' });
+    if (player.health <= 0) {
+      _emit(world, 'player-down', {});
+    }
+    return;
+  }
+  const vehicle = (world.vehicles || []).find((v) => v.id === target);
+  if (vehicle) {
+    damageVehicle(world, vehicle.id, amount);
+    _emit(world, 'damage', { amount, source: source || 'unknown' });
+    return;
+  }
+  const enemy = c.enemies.find((e) => e.id === target);
+  if (enemy && enemy.health > 0) {
+    enemy.health = Math.max(0, enemy.health - amount);
+    _emit(world, 'damage', { amount, source: source || 'unknown' });
+    if (enemy.health <= 0) {
+      enemy.state = 'down';
+    }
+    return;
+  }
+  const ped = (world.pedestrians || []).find((p) => p.id === target);
+  if (ped) {
+    ped.state = 'down';
+    ped.scared = true;
+    _emit(world, 'damage', { amount, source: source || 'unknown' });
+    _emit(world, 'crime', { kind: 'hit-ped', amount: 20 });
+  }
+}
+
+export function heal(world, amount) {
+  const player = world.player;
+  if (player.health <= 0) return 0;
+  const healed = Math.min(amount, 100 - player.health);
+  if (healed <= 0) return 0;
+  player.health += healed;
+  _emit(world, 'healed', { amount: healed, source: 'pickup' });
+  return healed;
+}
+
+function _enemyFire(world, dt) {
+  const c = _combat(world);
+  const player = world.player;
+  if (player.health <= 0) return;
+  for (const enemy of _aliveEnemies(world)) {
+    if (world.clock < enemy.nextShotAt) continue;
+    enemy.nextShotAt = world.clock + c.rng.range(ENEMY_SHOT_MIN, ENEMY_SHOT_MAX);
+    const dist = Math.hypot(player.pos.x - enemy.pos.x, player.pos.z - enemy.pos.z);
+    if (dist > PISTOL_RANGE) continue;
+    // 30% at 20 m, worse further away, better up close (capped at 60%).
+    const chance = Math.max(0.05, Math.min(0.6, ENEMY_HIT_AT_20M * (20 / Math.max(dist, 1))));
+    c.bullets.push({
+      from: { x: enemy.pos.x, y: 1.3, z: enemy.pos.z },
+      to: { x: player.pos.x, y: 1.3, z: player.pos.z },
+      ttl: 0.08,
+    });
+    if (c.rng.chance(chance)) {
+      if (player.onFoot) {
+        applyDamage(world, 'player', ENEMY_DAMAGE, 'enemy');
+      } else if (player.vehicleId) {
+        damageVehicle(world, player.vehicleId, ENEMY_DAMAGE * 0.75);
+      }
+    }
+  }
+}
+
+function _pickups(world) {
+  const c = _combat(world);
+  const player = world.player;
+  if (!player.onFoot || player.health <= 0) return;
+  for (const pickup of c.pickups) {
+    if (pickup.taken) continue;
+    const d = Math.hypot(player.pos.x - pickup.x, player.pos.z - pickup.z);
+    if (d > PICKUP_RADIUS) continue;
+    pickup.taken = true;
+    if (pickup.kind === 'health') {
+      const healed = heal(world, pickup.amount);
+      _emit(world, 'pickup', { kind: 'health', amount: healed });
+    } else if (pickup.kind === 'ammo') {
+      world.player.ammo = (world.player.ammo || 0) + pickup.amount;
+      _emit(world, 'pickup', { kind: 'ammo', amount: pickup.amount });
+    }
+  }
+  c.pickups = c.pickups.filter((p) => !p.taken);
+}
+
+export function updateCombat(world, dt) {
+  if (world.paused) return;
+  if (world.screen && world.screen !== 'play') return;
+  const c = _combat(world);
+  _spawnClinicPickup(world);
+
+  if (c.punchCooldown > 0) c.punchCooldown -= dt;
+  if (c.shootCooldown > 0) c.shootCooldown -= dt;
+
+  // Reload: 1.2 s, then move rounds from the player's ammo pool into the magazine.
+  if (c.reloading) {
+    c.reloadTimer -= dt;
+    if (c.reloadTimer <= 0) {
+      c.reloading = false;
+      const need = MAG_SIZE - c.magAmmo;
+      const moved = Math.min(need, world.player.ammo || 0);
+      c.magAmmo += moved;
+      world.player.ammo -= moved;
+    }
+  } else if (c.magAmmo <= 0 && (world.player.ammo || 0) > 0) {
+    reloadWeapon(world);
+  }
+
+  // Bullet tracers fade out fast; they are presentation only.
+  for (const b of c.bullets) b.ttl -= dt;
+  c.bullets = c.bullets.filter((b) => b.ttl > 0);
+
+  // Health regen: +2/s after 8 s without taking damage, up to 100.
+  const player = world.player;
+  if (player.health > 0 && player.health < 100 && world.clock - c.lastDamageAt >= REGEN_DELAY) {
+    player.health = Math.min(100, player.health + REGEN_RATE * dt);
+  }
+
+  _enemyFire(world, dt);
+  _pickups(world);
 }
