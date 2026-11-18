@@ -1,87 +1,91 @@
-# Solmar Bay — a Make GTA 6 entry
+# Solmar Bay
 
-[![gta6-01](https://make.fun/badge/gta6-01.svg)](https://make.fun/r/3mkd4a85)
-[![rank](https://make.fun/badge/gta6-01/andis7419-boop/gta6-01/rank.svg)](https://make.fun/r/3mkd4a85)
-[![reward](https://make.fun/badge/gta6-01/andis7419-boop/gta6-01/reward.svg)](https://make.fun/r/3mkd4a85)
+[![make.fun](https://make.fun/badge/gta6-01.svg)](https://make.fun/bounty/gta6-01)
+[![rank](https://make.fun/badge/gta6-01/andis7419-boop/gta6-01/rank.svg)](https://make.fun/bounty/gta6-01)
+[![reward](https://make.fun/badge/gta6-01/andis7419-boop/gta6-01/reward.svg)](https://make.fun/bounty/gta6-01)
 
 **Solmar Bay** is an original open-world crime game built for the
-[make.fun](https://make.fun/r/3mkd4a85) bounty **gta6-01 — "Make GTA 6"**
-([bounty page](https://make.fun/bounty/gta6-01)). Mara Solis, a harbour
-courier in the fictional sun-soaked coastal city of Solmar Bay, owes money
-to the Tide Crew and takes driving jobs from fixer Rosa Ibarra to clear the
-debt — while the Solmar Bay police, the rival Harbour Kings, traffic and
-pedestrians fill the streets around her.
+[make.fun "Make GTA 6" bounty](https://make.fun/bounty/gta6-01) (gta6-01):
+a sun-soaked fictional coastal city you can explore on foot and by car.
+Walk the streets or steal a car and drive; outrun the police as your
+wanted level rises, take on story missions, fight on foot, and save your
+progress. Traffic and pedestrians fill the streets, the HUD shows your
+cash, health and wanted stars beside a live minimap, and the whole city
+is procedural and deterministic — the same seed builds the same streets,
+traffic and missions. Everything in it — the city, characters, vehicles,
+story, art, sound and music — is original, made for this entry. No
+material from any commercial game.
 
-Everything is original and procedural: the city, the cars, the people, the
-story, the synthesised WebAudio sound and music. No assets, names, music or
-material from any commercial game. It runs entirely offline from static
-files in a desktop browser.
+Solmar Bay is a harbour city: a marina and beachfront,
+downtown, offices, shops, and streets between them all
+generated fresh from the seed. The sun moves over the city all day.
 
-## What is in the game
+Referral code: `3mkd4a85`
 
-- A procedural 8×8-block coastal city: Marina Quarter, Old Solmar, Palm Row,
-  Market Mile, Harbour Yards and North Hills, with traffic, pedestrians,
-  palms, lamps and a dusk light shift.
-- On foot and by car: walk, sprint, hop, punch, aim and shoot; steal parked
-  and traffic cars (0.8 s break-in), arcade driving with handbrake slides.
-- Wanted level (0–5 stars) with police cars that pursue and ram, foot cops
-  that arrest, escape timers, busted/wasted flow with fines and respawn.
-- 7 chained story missions from Rosa — taxi fares, theft, tailing, a
-  shootout, a timed harbour run, a getaway and a final chase — with cash
-  rewards, plus free roam between jobs.
-- HUD with health/armour bars, cash, wanted stars, clock, district name,
-  mission objective line, message toasts, briefing cards and a live
-  north-up minimap with player, traffic, police, objective and safehouse
-  blips.
-- Save/load (one slot, autosave every 30 sim seconds), pause menu, title
-  screen over the live city, help panel and mute.
-- Synthesised sound only: engine hum, two-tone sirens, gunshots, alarms,
-  UI sounds and an original 8-bar music loop (C major pentatonic).
+## Play
 
-## Run it
-
-Requires Node 22 only for the dev server and the dossier build; the game
-itself is plain static files.
+Serve `game/` with any static file server, or use the dev server:
 
 ```sh
 node serve.ts
-# open http://localhost:8080 in a desktop browser
 ```
 
-Or open `game/index.html` directly from the folder. Keyboard and mouse:
-WASD move/drive, mouse look/aim, E enter/steal car or start a job at the
-green phone blip, F punch, left mouse shoot (pistol), R reload, Space
-handbrake/hop, H horn, Esc/P pause, M mute, F1 help.
+Then open <http://localhost:8080>. The game runs offline in a desktop
+browser: plain static files under `game/`, no build step, no network
+requests. Add `?seed=N` to the URL to play a different city; the default
+seed is 1. Progress autosaves to the browser (one slot, Continue on the
+title screen loads it).
+
+## How to play
+
+You start on foot at the Marina safehouse. Earn cash from story missions —
+drive to the marker, meet the contact, do the job — and from lifting cars
+off the street. Crime raises your wanted level and brings the police;
+break line of sight and the heat cools off, get busted or wasted and you
+lose your take and your ride. Missions pay out, unlock the next job;
+the briefing card states the objective. The pistol (once owned)
+gives you a ranged option, with very limited ammo. The minimap shows you, the
+mission marker, and closing police. Loading a save respawns you on foot
+at the Marina safehouse with cash, missions and flags intact.
+
+## Controls
+
+| Action | Binding |
+| --- | --- |
+| Move / drive | W A S D (arrow keys work too) |
+| Sprint (on foot) | Shift |
+| Mouse look / aim | Mouse (pointer locked) |
+| Punch | F or left mouse |
+| Aim | Right mouse (hold) |
+| Shoot | Left mouse (aiming, pistol equipped) |
+| Reload | R |
+| Enter / exit / steal car | E (near a car, <= 3 m) |
+| Handbrake / jump | Space |
+| Horn (in car) | H |
+| Pause | Esc or P |
+| Mute | M |
+| Help | F1 |
+| Start mission / confirm | Enter (or E at a marker) |
+| Skip briefing | Enter |
 
 ## Screenshots
 
-The four shots in `screenshots/` are real captures of the game running in
-headless Chromium, staged deterministically:
+Four real captures in `screenshots/` (first by name is the cover):
 
-| File | Scene |
-|---|---|
-| `1-cover.jpg` | Police chase while driving (3 stars) |
-| `2-onfoot.jpg` | On foot downtown, Market Mile |
-| `3-mission.jpg` | Mission m5 "Harbour Run" in progress |
-| `4-title.jpg` | Title screen over the live city |
+- `1-cover.jpg` — police chase while driving, wanted stars, minimap, HUD.
+- `2-onfoot.jpg` — on foot downtown, pedestrians, stealable cars.
+- `3-mission.jpg` — mission in progress, objective marker, briefing text.
+- `4-title.jpg` — title screen over the live city.
 
-## Build the dossier
+## Entry
 
-```sh
-MAKEFUN_OUTPUT_DIR=out node main.ts
-# writes out/game/, out/screenshots/ and out/dossier.json
-```
+`main.ts` (Node 22, standard library only) hands the game in: it copies
+`game/` and `screenshots/` to `/output` (`MAKEFUN_OUTPUT_DIR` outside
+the grader) and writes `/output/dossier.json` with `buildDossier` from
+the vendored make.fun library (`vendor/makefun-game.ts`).
 
-## Layout
+## Credits
 
-- `game/index.html` — page, HUD DOM, import map for the vendored engine.
-- `game/src/` — the game's own source, one job per file
-  (`main`, `config`, `random`, `city`, `vehicles`, `traffic`,
-  `pedestrians`, `police`, `missions`, `combat`, `hud`, `audio`, `save`,
-  `input`, `render`, `shots`).
-- `game/vendor/three.module.min.js` — vendored three.js (minified).
-- `main.ts` / `vendor/makefun-game.ts` — the make.fun kit plumbing.
-
-## License
-
-MIT — see [LICENSE](LICENSE).
+Solmar Bay was built by an AI agent team for the make.fun gta6-01
+bounty. The 3D engine is three.js 0.170.0, vendored under
+`game/vendor/three.module.min.js`. MIT licensed — see LICENSE.

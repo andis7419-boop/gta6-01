@@ -1,60 +1,47 @@
-// Solmar Bay — entry packager for the gta6-01 bounty.
+// Solmar Bay — an original open-world crime game for the make.fun "Make GTA 6"
+// bounty (gta6-01): a sun-soaked coastal city you can explore on foot
+// or by car, built with three.js vendored under game/ as plain static files
+// (game/index.html and its ES modules) that load offline in a desktop browser
+// with no network request. This program hands the game in: it copies game/
+// and screenshots/ from beside this file to /output and writes
+// /output/dossier.json, the summary the judge reads, with the vendored
+// make.fun library. Put 3 or 4 PNG or JPEG screenshots in screenshots/
+// (the first by name is the cover) and run it.
 //
-// This program is the only thing the grader runs. It takes the finished
-// game (the static files under game/ plus the captured screenshots under
-// screenshots/), lays them out in the output directory, and asks the
-// vendored make.fun library to build the dossier the judge reads.
+// The city is procedural, deterministic: the same seed builds the same
+// streets, traffic, missions. Walk the streets or steal a car; outrun the
+// police as your wanted level climbs, take on story missions, fight on foot,
+// and save your progress. The cover shot shows it all together: HUD, minimap,
+// wanted stars, mission objectives, traffic, pedestrians.
 //
-// It is deliberately boring: standard library only, no clock, no random
-// numbers, no network. Running it twice over the same repo therefore
-// produces byte-identical output, which the grader checks.
-//
-// Usage:  MAKEFUN_OUTPUT_DIR=out node main.ts
-// (without the variable the output goes to /output, the grader's folder.)
+// Serve it locally with `node serve.ts`, then open http://localhost:8080.
+// Outside the grader's container, MAKEFUN_OUTPUT_DIR stands in for /output:
+//   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
 
 import { cpSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildDossier } from './vendor/makefun-game.ts';
 
-// The folder this file lives in is the repo root; game/ and screenshots/
-// sit beside it. The output folder comes from the environment so the
-// grader can point it at /output while a local run can use a scratch dir.
-const repoRoot = dirname(fileURLToPath(import.meta.url));
-const outputRoot = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+const here = fileURLToPath(new URL('.', import.meta.url));
+const out = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
-// The scorer's caps for this bounty. text_max_bytes is the one that
-// shapes the dossier text; the rest make this program refuse an entry
-// the scorer would refuse (too many or too large screenshots, a game/
-// folder over 993 files or 48 MiB, or a game path over 1000 bytes).
-const DOSSIER_LIMITS = {
-  text_max_bytes: 163840,
-  screenshots: { max: 4, max_bytes: 262144 },
-  game_max_files: 993,
-  game_max_bytes: 50331648,
-  game_path_max_bytes: 1000,
-};
+mkdirSync(out, { recursive: true });
+cpSync(join(here, 'game'), join(out, 'game'), { recursive: true });
+mkdirSync(join(out, 'screenshots'), { recursive: true });
+if (existsSync(join(here, 'screenshots'))) cpSync(join(here, 'screenshots'), join(out, 'screenshots'), { recursive: true });
 
-// Copy one top-level folder (game/ or screenshots/) into the output
-// directory, creating the destination first. A missing source folder is
-// skipped instead of crashing, so a repo without screenshots yet still
-// produces a dossier; the screenshots folder itself is always created
-// so the layout below is stable.
-function mirrorFolder(name) {
-  const from = join(repoRoot, name);
-  const to = join(outputRoot, name);
-  mkdirSync(to, { recursive: true });
-  if (existsSync(from)) {
-    cpSync(from, to, { recursive: true });
-  }
-}
-
-mkdirSync(outputRoot, { recursive: true });
-for (const folder of ['game', 'screenshots']) {
-  mirrorFolder(folder);
-}
-
+// The scorer's own caps (reference/gate.json): only text_max_bytes shapes the bytes; the others refuse an entry the
+// scorer would refuse (more than 4 screenshots or one over 256 KiB; more than 993 files in game/ or 48 MiB of game
+// files, in all, or a path under game/ over 1000 bytes: game/ counts beside /output's own 1000-entry cap, its
+// screenshots/ and dossier.json).
 writeFileSync(
-  join(outputRoot, 'dossier.json'),
-  buildDossier(outputRoot, DOSSIER_LIMITS),
+  join(out, 'dossier.json'),
+  buildDossier(out, {
+    text_max_bytes: 163840,
+    screenshots: { max: 4, max_bytes: 262144 },
+    game_max_files: 993,
+    game_max_bytes: 50331648,
+    game_path_max_bytes: 1000,
+  }),
 );
